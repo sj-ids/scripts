@@ -1,0 +1,345 @@
+#!/bin/bash
+set -e
+
+########################################
+# USER INPUT
+########################################
+echo "=== Magento Installation (FastCGI Backend) ==="
+
+read -p "Magento version (e.g. 2.4.7-p2): " MAGENTO_VERSION
+read -p "Domain (e.g. mag1.local): " DOMAIN
+read -p "System user (e.g. mag1user): " SYS_USER
+read -p "Web root (e.g. /var/www/mag1): " WEBROOT
+
+read -p "DB name: " DB_NAME
+read -p "DB user: " DB_USER
+read -s -p "DB password: " DB_PASS
+echo ""
+read -p "DB host [localhost]: " DB_HOST
+DB_HOST=${DB_HOST:-localhost}
+
+read -p "Magento public key: " MAGENTO_PUBLIC_KEY
+read -s -p "Magento private key: " MAGENTO_PRIVATE_KEY
+echo ""
+
+########################################
+# SANITY CHECK
+########################################
+[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
+
+########################################
+# PHP VERSION MAP
+########################################
+case "$MAGENTO_VERSION" in
+  2.4.7*|2.4.6*) PHP_VERSION="8.2" ;;
+  2.4.5*|2.4.4*) PHP_VERSION="8.1" ;;
+  *) echo "Unsupported Magento version"; exit 1 ;;
+esac
+
+SOCKET="/run/php/${SYS_USER}.sock"
+NGINX_CONF="/etc/nginx/sites-available/${DOMAIN}.conf"
+
+########################################
+# SYSTEM USER
+########################################
+useradd -m -s /bin/bash ${SYS_USER} || true
+
+########################################
+# PACKAGES (Magento strict requirements)
+########################################
+
+echo "=== Checking Magento system requirements ==="
+
+########################################
+# PHP CHECK
+########################################
+add-apt-repository ppa:ondrej/php -y
+apt update
+
+REQUIRED_PHP="${PHP_VERSION}"
+
+if command -v php >/dev/null 2>&1; then
+  CURRENT_PHP=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+else
+  CURRENT_PHP=""
+fi
+
+if [[ "$CURRENT_PHP" != "$REQUIRED_PHP" ]]; then
+  echo "Installing PHP ${REQUIRED_PHP} (Magento required)"
+  apt install -y php${REQUIRED_PHP}-cli php${REQUIRED_PHP}-fpm
+  update-alternatives --set php /usr/bin/php${REQUIRED_PHP}
+else
+  echo "PHP ${CURRENT_PHP} already compatible"
+fi
+
+########################################
+# PHP EXTENSIONS (STRICT)
+########################################
+echo "Installing required PHP extensions..."
+
+apt install -y \
+  php${REQUIRED_PHP}-{cli,fpm,common,curl,gd,intl,mbstring,mysql,soap,xml,zip,bcmath,ctype,dom,fileinfo,openssl,sockets,sodium,simplexml}
+
+########################################
+# DATABASE CHECK (STRICT ENFORCEMENT)
+########################################
+echo "Checking database compatibility..."
+
+if command -v mysql >/dev/null 2>&1; then
+  DB_VERSION_FULL=$(mysql -V)
+  echo "Detected DB: $DB_VERSION_FULL"
+
+  if echo "$DB_VERSION_FULL" | grep -qi "MariaDB"; then
+    DB_VERSION=$(echo "$DB_VERSION_FULL" | awk '{print $5}' | tr -d ',' | cut -d. -f1,2)
+    if [[ "$DB_VERSION" < "10.4" || "$DB_VERSION" > "10.6" ]]; then
+      echo "ERROR: MariaDB ${DB_VERSION} is NOT supported by Magento"
+      echo "Supported: MariaDB 10.4 – 10.6"
+      exit 1
+    fi
+  else
+    DB_VERSION=$(echo "$DB_VERSION_FULL" | awk '{print $5}' | tr -d ',' | cut -d. -f1)
+    if [[ "$DB_VERSION" != "8" ]]; then
+      echo "ERROR: MySQL ${DB_VERSION} is NOT supported"
+      echo "Magento requires MySQL 8.0.x"
+      exit 1
+    fi
+  fi
+else
+  echo "No database detected. Installing MariaDB 10.6 (Magento supported)..."
+  # Add MariaDB official repository (10.6)
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
+  bash -s -- --mariadb-server-version=10.6
+
+  apt update
+  apt install -y mariadb-server mariadb-client
+fi
+
+########################################
+# CORE PACKAGES
+########################################
+apt install -y nginx mariadb-server unzip curl git software-properties-common openjdk-17-jdk
+
+
+########################################
+# PHP-FPM POOL (FASTCGI SOCKET)
+########################################
+cat > /etc/php/${PHP_VERSION}/fpm/pool.d/${SYS_USER}.conf <<EOF
+[${SYS_USER}]
+user = ${SYS_USER}
+group = ${SYS_USER}
+listen = ${SOCKET}
+listen.owner = www-data
+listen.group = www-data
+pm = dynamic
+pm.max_children = 20
+pm.start_servers = 4
+pm.min_spare_servers = 2
+pm.max_spare_servers = 6
+chdir = /
+EOF
+
+systemctl restart php${PHP_VERSION}-fpm
+
+########################################
+# DATABASE
+########################################
+mysql -uroot <<MYSQL
+CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'%';
+FLUSH PRIVILEGES;
+MYSQL
+
+########################################
+# OPENSEARCH (MAGENTO 2.4.6+)
+########################################
+
+OPENSEARCH_REQUIRED_MAJOR=2
+OPENSEARCH_VERSION="2.12.0"
+OPENSEARCH_DIR="/opt/opensearch"
+OPENSEARCH_USER="opensearch"
+
+echo "Checking OpenSearch..."
+
+if curl -s http://127.0.0.1:9200 >/dev/null 2>&1; then
+  EXISTING_VERSION=$(curl -s http://127.0.0.1:9200 | grep '"number"' | cut -d'"' -f4)
+  EXISTING_MAJOR=$(echo "$EXISTING_VERSION" | cut -d. -f1)
+
+  if [[ "$EXISTING_MAJOR" == "$OPENSEARCH_REQUIRED_MAJOR" ]]; then
+    echo "OpenSearch ${EXISTING_VERSION} detected and compatible. Skipping installation."
+    SKIP_OPENSEARCH_INSTALL=true
+  else
+    echo "Incompatible OpenSearch version detected (${EXISTING_VERSION}). Reinstalling."
+    systemctl stop opensearch || true
+    rm -rf ${OPENSEARCH_DIR}
+  fi
+else
+  echo "OpenSearch not running. Installing..."
+fi
+
+if [[ "${SKIP_OPENSEARCH_INSTALL}" != "true" ]]; then
+
+  id -u ${OPENSEARCH_USER} &>/dev/null || \
+    useradd --system --home ${OPENSEARCH_DIR} --shell /usr/sbin/nologin ${OPENSEARCH_USER}
+
+  cd /opt
+  rm -f opensearch-${OPENSEARCH_VERSION}-linux-x64.tar.gz
+  curl -LO https://artifacts.opensearch.org/releases/bundle/opensearch/${OPENSEARCH_VERSION}/opensearch-${OPENSEARCH_VERSION}-linux-x64.tar.gz
+
+  tar -xzf opensearch-${OPENSEARCH_VERSION}-linux-x64.tar.gz
+  mv opensearch-${OPENSEARCH_VERSION} ${OPENSEARCH_DIR}
+
+  cat > ${OPENSEARCH_DIR}/config/opensearch.yml <<EOF
+cluster.name: magento-opensearch
+node.name: node-1
+network.host: 127.0.0.1
+http.port: 9200
+discovery.type: single-node
+plugins.security.disabled: true
+EOF
+
+  cat > ${OPENSEARCH_DIR}/config/jvm.options <<EOF
+-Xms512m
+-Xmx512m
+EOF
+
+  chown -R ${OPENSEARCH_USER}:${OPENSEARCH_USER} ${OPENSEARCH_DIR}
+
+  cat > /etc/systemd/system/opensearch.service <<EOF
+[Unit]
+Description=OpenSearch
+After=network.target
+
+[Service]
+User=${OPENSEARCH_USER}
+Group=${OPENSEARCH_USER}
+WorkingDirectory=${OPENSEARCH_DIR}
+ExecStart=${OPENSEARCH_DIR}/bin/opensearch
+Restart=always
+LimitNOFILE=65535
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now opensearch
+
+  echo "Waiting for OpenSearch to start..."
+  sleep 30
+
+  curl -s http://127.0.0.1:9200 >/dev/null || {
+    echo "ERROR: OpenSearch failed to start"
+    exit 1
+  }
+fi
+
+
+########################################
+# WEB ROOT
+########################################
+mkdir -p ${WEBROOT}
+chown -R ${SYS_USER}:${SYS_USER} ${WEBROOT}
+
+########################################
+# NGINX (FASTCGI BACKEND + SAMPLE CONF)
+########################################
+cat > ${NGINX_CONF} <<EOF
+upstream fastcgi_backend {
+    server unix:${SOCKET};
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    set \$MAGE_ROOT ${WEBROOT};
+    include ${WEBROOT}/nginx.conf.sample;
+
+    client_max_body_size 300M;
+
+    access_log /var/log/nginx/${DOMAIN}.access.log;
+    error_log  /var/log/nginx/${DOMAIN}.error.log;
+
+    location ~* \.php$ {
+        fastcgi_pass fastcgi_backend;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
+    }
+}
+EOF
+
+ln -sf ${NGINX_CONF} /etc/nginx/sites-enabled/${DOMAIN}.conf
+nginx -t && systemctl reload nginx
+
+########################################
+# COMPOSER
+########################################
+command -v composer >/dev/null || {
+  curl -sS https://getcomposer.org/installer | php
+  mv composer.phar /usr/local/bin/composer
+}
+
+########################################
+# MAGENTO INSTALL
+########################################
+su - ${SYS_USER} <<EOF
+set -e
+
+export COMPOSER_HOME=/home/${SYS_USER}/.composer
+mkdir -p ~/.composer
+
+cat > ~/.composer/auth.json <<AUTH
+{
+  "http-basic": {
+    "repo.magento.com": {
+      "username": "${MAGENTO_PUBLIC_KEY}",
+      "password": "${MAGENTO_PRIVATE_KEY}"
+    }
+  }
+}
+AUTH
+chmod 600 ~/.composer/auth.json
+
+cd ${WEBROOT}
+
+composer create-project --repository-url=https://repo.magento.com \
+  magento/project-community-edition=${MAGENTO_VERSION} .
+
+php bin/magento setup:install \
+ --base-url=http://${DOMAIN} \
+ --db-host=${DB_HOST} \
+ --db-name=${DB_NAME} \
+ --db-user=${DB_USER} \
+ --db-password='${DB_PASS}' \
+ --search-engine=opensearch \
+ --opensearch-host=127.0.0.1 \
+ --opensearch-port=9200 \
+ --opensearch-index-prefix=magento \
+ --admin-firstname=Admin \
+ --admin-lastname=User \
+ --admin-email=admin@${DOMAIN} \
+ --admin-user=admin \
+ --admin-password=Admin123! \
+ --backend-frontname=admin \
+ --language=en_US \
+ --currency=USD \
+ --timezone=UTC \
+ --use-rewrites=1
+
+php bin/magento deploy:mode:set developer
+php bin/magento cache:flush
+php bin/magento indexer:reindex
+php bin/magento cron:install
+EOF
+
+########################################
+# PERMISSIONS
+########################################
+chown -R ${SYS_USER}:www-data ${WEBROOT}
+find ${WEBROOT} -type d -exec chmod 775 {} +
+find ${WEBROOT} -type f -exec chmod 664 {} +
+
+echo "Magento installed successfully"
