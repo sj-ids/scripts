@@ -2,6 +2,11 @@
 set -e
 
 ########################################
+# SANITY CHECK
+########################################
+[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
+
+########################################
 # USER INPUT
 ########################################
 echo "=== Magento Installation (FastCGI Backend) ==="
@@ -22,10 +27,6 @@ read -p "Magento public key: " MAGENTO_PUBLIC_KEY
 read -s -p "Magento private key: " MAGENTO_PRIVATE_KEY
 echo ""
 
-########################################
-# SANITY CHECK
-########################################
-[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
 
 ########################################
 # PHP VERSION MAP
@@ -75,15 +76,105 @@ fi
 ########################################
 # PHP EXTENSIONS (STRICT)
 ########################################
-echo "Installing required PHP extensions..."
+echo "Checking required PHP extensions..."
 
-apt install -y \
-  php${REQUIRED_PHP}-{cli,fpm,common,curl,gd,intl,mbstring,mysql,soap,xml,zip,bcmath,ctype,dom,fileinfo,openssl,sockets,sodium,simplexml}
+REQUIRED_EXTS=(
+  bcmath
+  curl
+  gd
+  intl
+  mbstring
+  mysql
+  soap
+  xml
+  zip
+  openssl
+  sodium
+  ctype
+  dom
+  fileinfo
+  simplexml
+)
+
+MISSING_EXTS=()
+
+for ext in "${REQUIRED_EXTS[@]}"; do
+  if ! php -m | grep -qi "^${ext}$"; then
+    MISSING_EXTS+=("$ext")
+  fi
+done
+
+if [ ${#MISSING_EXTS[@]} -eq 0 ]; then
+  echo "All required PHP extensions are already installed."
+else
+  echo "Missing PHP extensions: ${MISSING_EXTS[*]}"
+  echo "Installing required PHP packages..."
+
+  apt install -y \
+    php${REQUIRED_PHP}-cli \
+    php${REQUIRED_PHP}-fpm \
+    php${REQUIRED_PHP}-common \
+    php${REQUIRED_PHP}-curl \
+    php${REQUIRED_PHP}-gd \
+    php${REQUIRED_PHP}-intl \
+    php${REQUIRED_PHP}-mbstring \
+    php${REQUIRED_PHP}-mysql \
+    php${REQUIRED_PHP}-soap \
+    php${REQUIRED_PHP}-xml \
+    php${REQUIRED_PHP}-zip \
+    php${REQUIRED_PHP}-bcmath
+fi
+
+php -m >/dev/null
+
 
 ########################################
-# DATABASE CHECK (STRICT ENFORCEMENT)
+# DATABASE CHECK (STRICT + CONFIRMATION)
 ########################################
 echo "Checking database compatibility..."
+
+install_mariadb_106() {
+  echo "--------------------------------------------------"
+  echo "⚠ WARNING: DATABASE CHANGE REQUIRED"
+  echo "--------------------------------------------------"
+  echo "Installed database is NOT compatible with Magento."
+  echo "Magento supports:"
+  echo "  • MariaDB 10.4 – 10.6"
+  echo "  • MySQL 8.0.x"
+  echo ""
+  echo "This action WILL:"
+  echo "  - STOP the current database service"
+  echo "  - UNINSTALL the existing database server"
+  echo "  - INSTALL MariaDB 10.6"
+  echo ""
+  echo "❗ DATA LOSS RISK:"
+  echo "If you have existing databases, BACK THEM UP FIRST!"
+  echo ""
+  read -p "Do you want to continue? (yes/no): " CONFIRM
+
+  if [[ "$CONFIRM" != "yes" ]]; then
+    echo "Aborting to prevent data loss."
+    echo "Please take a backup and re-run the script."
+    exit 1
+  fi
+
+  echo "Proceeding with MariaDB 10.6 installation..."
+
+  systemctl stop mysql mariadb 2>/dev/null || true
+  apt remove -y mysql-server mysql-client mariadb-server mariadb-client || true
+  apt autoremove -y
+
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
+    bash -s -- --mariadb-server-version=10.6
+
+  apt update
+  apt install -y mariadb-server mariadb-client
+
+  systemctl enable mariadb
+  systemctl start mariadb
+
+  echo "MariaDB 10.6 installed successfully."
+}
 
 if command -v mysql >/dev/null 2>&1; then
   DB_VERSION_FULL=$(mysql -V)
@@ -92,26 +183,24 @@ if command -v mysql >/dev/null 2>&1; then
   if echo "$DB_VERSION_FULL" | grep -qi "MariaDB"; then
     DB_VERSION=$(echo "$DB_VERSION_FULL" | awk '{print $5}' | tr -d ',' | cut -d. -f1,2)
     if [[ "$DB_VERSION" < "10.4" || "$DB_VERSION" > "10.6" ]]; then
-      echo "ERROR: MariaDB ${DB_VERSION} is NOT supported by Magento"
-      echo "Supported: MariaDB 10.4 – 10.6"
-      exit 1
+      echo "MariaDB ${DB_VERSION} is NOT supported by Magento."
+      install_mariadb_106
+    else
+      echo "MariaDB ${DB_VERSION} is compatible."
     fi
   else
-    DB_VERSION=$(echo "$DB_VERSION_FULL" | awk '{print $5}' | tr -d ',' | cut -d. -f1)
-    if [[ "$DB_VERSION" != "8" ]]; then
-      echo "ERROR: MySQL ${DB_VERSION} is NOT supported"
-      echo "Magento requires MySQL 8.0.x"
-      exit 1
+    MYSQL_MAJOR=$(echo "$DB_VERSION_FULL" | awk '{print $5}' | tr -d ',' | cut -d. -f1)
+    if [[ "$MYSQL_MAJOR" != "8" ]]; then
+      echo "MySQL ${MYSQL_MAJOR} is NOT supported by Magento."
+      install_mariadb_106
+    else
+      echo "MySQL 8.x detected (compatible)."
     fi
   fi
 else
-  echo "No database detected. Installing MariaDB 10.6 (Magento supported)..."
-  # Add MariaDB official repository (10.6)
-  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
-  bash -s -- --mariadb-server-version=10.6
-
-  apt update
-  apt install -y mariadb-server mariadb-client
+  echo "No database detected."
+  echo "Installing MariaDB 10.6..."
+  install_mariadb_106
 fi
 
 ########################################
