@@ -1,1 +1,256 @@
+#!/bin/bash
+set -e
+
+########################################
+# SANITY CHECK
+########################################
+[[ $EUID -ne 0 ]] && echo "Run as root" && exit 1
+
+########################################
+# USER INPUT
+########################################
+echo "=== Magento Installation ==="
+
+read -p "Magento version (e.g. 2.4.7-p2): " MAGENTO_VERSION
+read -p "Domain (e.g. mag1.local): " DOMAIN
+read -p "System user (e.g. mag1user): " SYS_USER
+read -p "Web root (e.g. /var/www/mag1): " WEBROOT
+
+read -p "DB name: " DB_NAME
+read -p "DB user: " DB_USER
+read -s -p "DB password: " DB_PASS
+echo ""
+read -p "DB host [localhost]: " DB_HOST
+DB_HOST=${DB_HOST:-localhost}
+
+read -p "Magento public key: " MAGENTO_PUBLIC_KEY
+read -s -p "Magento private key: " MAGENTO_PRIVATE_KEY
+echo ""
+
+########################################
+# DATABASE ENGINE SELECTION
+########################################
+echo "Choose database engine:"
+echo "1) MySQL"
+echo "2) MariaDB"
+read -p "Enter choice [1-2]: " DB_CHOICE
+
+case "$DB_CHOICE" in
+  1) DB_ENGINE="mysql" ;;
+  2) DB_ENGINE="mariadb" ;;
+  *) echo "Invalid choice"; exit 1 ;;
+esac
+
+########################################
+# MAGENTO REQUIREMENTS RESOLVER
+########################################
+resolve_magento_requirements() {
+
+  UBUNTU_VERSION=$(lsb_release -rs)
+  DB_VALIDATION_FLAG=""
+  SEARCH_ENGINE=""
+  PHP_ALLOWED=()
+
+  case "$MAGENTO_VERSION" in
+
+    2.4.0|2.4.1|2.4.2|2.4.3)
+      PHP_ALLOWED=("7.4")
+      SEARCH_ENGINE="elasticsearch"
+      ;;
+
+    2.4.4|2.4.5)
+      PHP_ALLOWED=("8.1")
+      SEARCH_ENGINE="elasticsearch"
+      ;;
+
+    2.4.6)
+      PHP_ALLOWED=("8.1" "8.2")
+      SEARCH_ENGINE="opensearch"
+      ;;
+
+    2.4.7*)
+      PHP_ALLOWED=("8.2" "8.3")
+      SEARCH_ENGINE="opensearch"
+      ;;
+
+    2.4.8*)
+      PHP_ALLOWED=("8.3" "8.4")
+      SEARCH_ENGINE="opensearch"
+      ;;
+
+    *)
+      echo "❌ Unsupported Magento version: $MAGENTO_VERSION"
+      exit 1
+      ;;
+  esac
+
+  ########################################
+  # Ubuntu 24.04 override
+  ########################################
+  if [[ "$UBUNTU_VERSION" == "24.04" && "$DB_ENGINE" == "mariadb" ]]; then
+    echo "⚠ Ubuntu 24.04 detected → using MariaDB 10.11"
+    TARGET_MARIADB="10.11"
+    DB_VALIDATION_FLAG="--skip-db-validation"
+  else
+    TARGET_MARIADB="10.6"
+  fi
+
+  export PHP_ALLOWED
+  export SEARCH_ENGINE
+  export TARGET_MARIADB
+  export DB_VALIDATION_FLAG
+}
+
+resolve_magento_requirements
+
+########################################
+# PHP VERSION SELECTION
+########################################
+echo "Supported PHP versions: ${PHP_ALLOWED[*]}"
+
+if command -v php >/dev/null 2>&1; then
+  INSTALLED_PHP=$(php -r 'echo PHP_MAJOR_VERSION "." PHP_MINOR_VERSION;')
+else
+  INSTALLED_PHP=""
+fi
+
+if [[ ! " ${PHP_ALLOWED[*]} " =~ " ${INSTALLED_PHP} " ]]; then
+  REQUIRED_PHP="${PHP_ALLOWED[0]}"
+else
+  REQUIRED_PHP="$INSTALLED_PHP"
+fi
+
+########################################
+# SYSTEM USER
+########################################
+useradd -m -s /bin/bash ${SYS_USER} || true
+
+########################################
+# PHP INSTALL
+########################################
+add-apt-repository ppa:ondrej/php -y
+apt update
+
+apt install -y \
+  php${REQUIRED_PHP}-{cli,fpm,common,curl,gd,intl,mbstring,mysql,soap,xml,zip,bcmath}
+
+update-alternatives --set php /usr/bin/php${REQUIRED_PHP}
+
+########################################
+# DATABASE INSTALL (SAFE + CONFIRMATION)
+########################################
+install_mariadb() {
+  echo "⚠ Database change required"
+  echo "Target: MariaDB ${TARGET_MARIADB}"
+  echo "Type 'yes' to continue:"
+  read CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && exit 1
+
+  systemctl stop mysql mariadb 2>/dev/null || true
+  apt remove -y mysql-server mariadb-server || true
+  apt autoremove -y
+
+  curl -LsS https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | \
+    bash -s -- --mariadb-server-version=${TARGET_MARIADB}
+
+  apt update
+  apt install -y mariadb-server mariadb-client
+  systemctl enable --now mariadb
+}
+
+install_mysql() {
+  apt install -y mysql-server
+  systemctl enable --now mysql
+}
+
+if [[ "$DB_ENGINE" == "mariadb" ]]; then
+  install_mariadb
+else
+  install_mysql
+fi
+
+########################################
+# DATABASE CREATION
+########################################
+mysql -uroot <<MYSQL
+CREATE DATABASE IF NOT EXISTS ${DB_NAME};
+CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'%';
+FLUSH PRIVILEGES;
+MYSQL
+
+########################################
+# CORE PACKAGES
+########################################
+apt install -y nginx unzip curl git openjdk-17-jdk
+
+########################################
+# OPENSEARCH
+########################################
+OPENSEARCH_VERSION="2.12.0"
+cd /opt
+curl -LO https://artifacts.opensearch.org/releases/bundle/opensearch/${OPENSEARCH_VERSION}/opensearch-${OPENSEARCH_VERSION}-linux-x64.tar.gz
+tar -xzf opensearch-${OPENSEARCH_VERSION}-linux-x64.tar.gz
+mv opensearch-${OPENSEARCH_VERSION} opensearch
+
+########################################
+# WEB ROOT
+########################################
+mkdir -p ${WEBROOT}
+chown -R ${SYS_USER}:${SYS_USER} ${WEBROOT}
+
+########################################
+# COMPOSER
+########################################
+command -v composer >/dev/null || {
+  curl -sS https://getcomposer.org/installer | php
+  mv composer.phar /usr/local/bin/composer
+}
+
+########################################
+# MAGENTO INSTALL
+########################################
+su - ${SYS_USER} <<EOF
+set -e
+
+mkdir -p ~/.composer
+cat > ~/.composer/auth.json <<AUTH
+{
+  "http-basic": {
+    "repo.magento.com": {
+      "username": "${MAGENTO_PUBLIC_KEY}",
+      "password": "${MAGENTO_PRIVATE_KEY}"
+    }
+  }
+}
+AUTH
+
+cd ${WEBROOT}
+
+composer create-project --repository-url=https://repo.magento.com \
+  magento/project-community-edition=${MAGENTO_VERSION} .
+
+php bin/magento setup:install \
+ --base-url=http://${DOMAIN} \
+ --db-host=${DB_HOST} \
+ --db-name=${DB_NAME} \
+ --db-user=${DB_USER} \
+ --db-password='${DB_PASS}' \
+ ${DB_VALIDATION_FLAG} \
+ --search-engine=opensearch \
+ --opensearch-host=127.0.0.1 \
+ --opensearch-port=9200 \
+ --admin-firstname=Admin \
+ --admin-lastname=User \
+ --admin-email=admin@${DOMAIN} \
+ --admin-user=admin \
+ --admin-password=Admin123! \
+ --backend-frontname=admin \
+ --language=en_US \
+ --currency=USD \
+ --timezone=UTC \
+ --use-rewrites=1
+EOF
+
+echo "✅ Magento ${MAGENTO_VERSION} installed successfully"
 
