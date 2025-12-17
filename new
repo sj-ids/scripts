@@ -222,7 +222,10 @@ apt install -y nginx mariadb-server unzip curl git software-properties-common op
 ########################################
 # PHP-FPM POOL (FASTCGI SOCKET)
 ########################################
-cat > /etc/php/${PHP_VERSION}/fpm/pool.d/${SYS_USER}.conf <<EOF
+DOMAIN_SAFE=$(echo "${DOMAIN}" | tr '.' '_')
+
+
+cat > /etc/php/${PHP_VERSION}/fpm/pool.d/${SYS_USER}_${DOMAIN_SAFE}.conf <<EOF
 [${SYS_USER}]
 user = ${SYS_USER}
 group = ${SYS_USER}
@@ -341,37 +344,6 @@ fi
 mkdir -p ${WEBROOT}
 chown -R ${SYS_USER}:${SYS_USER} ${WEBROOT}
 
-########################################
-# NGINX (FASTCGI BACKEND + SAMPLE CONF)
-########################################
-cat > ${NGINX_CONF} <<EOF
-upstream fastcgi_backend {
-    server unix:${SOCKET};
-}
-
-server {
-    listen 80;
-    server_name ${DOMAIN};
-
-    set \$MAGE_ROOT ${WEBROOT};
-    include ${WEBROOT}/nginx.conf.sample;
-
-    client_max_body_size 300M;
-
-    access_log /var/log/nginx/${DOMAIN}.access.log;
-    error_log  /var/log/nginx/${DOMAIN}.error.log;
-
-    location ~* \.php$ {
-        fastcgi_pass fastcgi_backend;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
-        fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
-    }
-}
-EOF
-
-ln -sf ${NGINX_CONF} /etc/nginx/sites-enabled/${DOMAIN}.conf
-nginx -t && systemctl reload nginx
 
 ########################################
 # COMPOSER
@@ -441,5 +413,70 @@ EOF
 chown -R ${SYS_USER}:www-data ${WEBROOT}
 find ${WEBROOT} -type d -exec chmod 775 {} +
 find ${WEBROOT} -type f -exec chmod 664 {} +
+
+
+########################################
+# Nginx file handling
+########################################
+# Normalize domain for nginx identifier
+FASTCGI_NAME="fastcgi_backend_$(echo ${DOMAIN} | tr '.' '_')"
+
+
+MAGENTO_NGINX_SAMPLE="${WEBROOT}/nginx.conf.sample"
+MAGENTO_NGINX_CONF="${WEBROOT}/nginx.conf"
+
+if [[ ! -f "${MAGENTO_NGINX_CONF}" ]]; then
+  if [[ -f "${MAGENTO_NGINX_SAMPLE}" ]]; then
+    echo "Creating Magento nginx.conf from sample..."
+    cp ${MAGENTO_NGINX_SAMPLE} ${MAGENTO_NGINX_CONF}
+  else
+    echo "❌ Magento nginx.conf.sample not found"
+    exit 1
+  fi
+else
+  echo "Magento nginx.conf already exists — skipping copy"
+fi
+
+#renaming to match the name 
+if grep -q "fastcgi_backend;" "${MAGENTO_NGINX_CONF}"; then
+  echo "Patching fastcgi backend name in Magento nginx.conf..."
+  sed -i "s/fastcgi_backend;/${FASTCGI_NAME};/g" "${MAGENTO_NGINX_CONF}"
+else
+  echo "fastcgi backend already patched — skipping"
+fi
+
+#writing nginx config
+cat > ${NGINX_CONF} <<EOF
+upstream ${FASTCGI_NAME} {
+    server unix:${SOCKET};
+}
+
+server {
+    listen 80;
+    server_name ${DOMAIN};
+
+    set \$MAGE_ROOT ${WEBROOT};
+    include ${MAGENTO_NGINX_CONF};
+
+    client_max_body_size 300M;
+
+    access_log /var/log/nginx/${DOMAIN}.access.log;
+    error_log  /var/log/nginx/${DOMAIN}.error.log;
+
+    location ~* \.php\$ {
+        fastcgi_pass ${FASTCGI_NAME};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param SCRIPT_NAME \$fastcgi_script_name;
+    }
+}
+EOF
+
+
+ln -sf ${NGINX_CONF} /etc/nginx/sites-enabled/${DOMAIN}.conf
+
+nginx -t
+systemctl reload nginx
+
 
 echo "Magento installed successfully"
